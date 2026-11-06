@@ -9,14 +9,15 @@ import string
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-import requests
 from colorama import Fore, Style, init
 from curl_cffi import requests as cr
+from temptf import Message, TempTFClient
 
 init(autoreset=True)
 
@@ -28,12 +29,20 @@ ACCOUNTS = LOGS / "accounts.json"
 
 API = "https://api.worols.com"
 WEB = "https://play.worols.com"
-MAILTM = "https://api.mail.tm"
 UA = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UQ1A.240205.07131809; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/124.0.6367.82 Mobile Safari/537.36"
 
 MAX_ATTEMPTS = 3
 MAIL_TIMEOUT = 120
 DEFAULT_WORKERS = 3
+
+MAIL_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("all", "all providers (gmail + high.edu.pl)"),
+    ("gmail", "gmail.com (dot + plus)"),
+    ("gmail-dot", "gmail.com (dot only)"),
+    ("gmail-plus", "gmail.com (plus only)"),
+    ("high.edu.pl", "high.edu.pl (edu)"),
+)
+MAIL_PROVIDERS = tuple(k for k, _ in MAIL_OPTIONS)
 
 BANNER = f"""
 {Fore.MAGENTA}╦ ╦╔═╗╦═╗╔═╗╦  ╔═╗
@@ -122,6 +131,37 @@ def _ask_int(prompt: str, default: int) -> int:
         return default
 
 
+def _ask_providers(raw_arg: str = "") -> list[str]:
+    if raw_arg:
+        chosen = [p.strip().lower() for p in raw_arg.split(",") if p.strip()]
+        valid = [p for p in chosen if p in MAIL_PROVIDERS]
+        if valid:
+            return ["all"] if "all" in valid else valid
+
+    print(f"  {Fore.CYAN}mail providers:{Style.RESET_ALL}")
+    for i, (key, desc) in enumerate(MAIL_OPTIONS, 1):
+        print(f"    {Fore.CYAN}{i}{Style.RESET_ALL}) {key:<12} {Fore.WHITE}{desc}{Style.RESET_ALL}")
+    raw = _ask("select (e.g. 1 or 2,5)", "1")
+
+    selected: list[str] = []
+    for part in raw.replace(" ", ",").split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part.isdigit():
+            idx = int(part)
+            if 1 <= idx <= len(MAIL_OPTIONS):
+                key = MAIL_OPTIONS[idx - 1][0]
+                if key not in selected:
+                    selected.append(key)
+        elif part in MAIL_PROVIDERS and part not in selected:
+            selected.append(part)
+
+    if not selected or "all" in selected:
+        return ["all"]
+    return selected
+
+
 def gen_username() -> str:
     return random.choice(_USERNAME_PATTERNS)(random.choice(_FIRST), random.choice(_LAST))
 
@@ -206,33 +246,35 @@ def save_account(row: dict) -> None:
         os.replace(tmp, ACCOUNTS)
 
 
-def _hydra(data) -> list:
-    return data["hydra:member"] if isinstance(data, dict) else data
-
-
-class MailTm:
-    def __init__(self, proxy: str | None = None):
-        self.s = requests.Session()
-        self.s.headers["accept"] = "application/json"
+class TempMail:
+    def __init__(self, providers: list[str] | None = None, proxy: str | None = None):
+        opener = None
         if proxy:
-            self.s.proxies.update({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        self.client = TempTFClient(timeout=20.0, opener=opener)
+        self.providers = providers or ["all"]
         self.address = ""
-        self.password = ""
 
     def create(self) -> str:
+        choice = random.choice(self.providers)
         for attempt in range(3):
             try:
-                items = _hydra(self.s.get(f"{MAILTM}/domains", timeout=20).json())
-                if not items:
-                    raise RuntimeError("no domains")
-                local = gen_username().replace(".", "") + str(random.randint(10, 99))
-                self.address = f"{local}@{items[0]['domain']}"
-                self.password = gen_password()
-                r = self.s.post(f"{MAILTM}/accounts", json={"address": self.address, "password": self.password}, timeout=20)
-                r.raise_for_status()
-                tok = self.s.post(f"{MAILTM}/token", json={"address": self.address, "password": self.password}, timeout=20)
-                tok.raise_for_status()
-                self.s.headers["authorization"] = f"Bearer {tok.json()['token']}"
+                if choice == "gmail":
+                    self.address = self.client.create_gmail()
+                elif choice == "gmail-dot":
+                    self.address = self.client.create_gmail_dot()
+                elif choice == "gmail-plus":
+                    self.address = self.client.create_gmail_plus()
+                elif choice == "high.edu.pl":
+                    self.address = self.client.create_edu()
+                else:
+                    self.address = self.client.create_email(
+                        providers=("gmail", "high.edu.pl"),
+                        dot=True,
+                        plus=True,
+                    )
                 return self.address
             except Exception:
                 if attempt == 2:
@@ -240,47 +282,30 @@ class MailTm:
                 time.sleep(2 + attempt * 2)
         return ""
 
-    def _reauth(self) -> None:
-        tok = self.s.post(f"{MAILTM}/token", json={"address": self.address, "password": self.password}, timeout=20)
-        if tok.status_code == 200:
-            self.s.headers["authorization"] = f"Bearer {tok.json()['token']}"
+    @staticmethod
+    def _extract_link(msg: Message) -> str | None:
+        if "worols" not in f"{msg.sender} {msg.subject}".lower():
+            return None
+        raw = f"{msg.text} {msg.body}".replace("&amp;", "&")
+        m = re.search(r"https?://[^\s\"'<>\\]*activate_account\?[^\s\"'<>\\]+", raw)
+        if m:
+            return m.group(0)
+        m = re.search(r"activate_account\?token=([\w\-.=]+)", raw)
+        if m:
+            return f"https://worols.com/activate_account?token={m.group(1)}"
+        return None
 
     def wait_activation_link(self, timeout: float = MAIL_TIMEOUT) -> str | None:
-        end = time.time() + timeout
-        reauthed = False
-        while time.time() < end:
-            try:
-                r = self.s.get(f"{MAILTM}/messages", timeout=20)
-                if r.status_code == 401 and not reauthed:
-                    reauthed = True
-                    self._reauth()
-                    continue
-                items = _hydra(r.json())
-            except Exception:
-                time.sleep(4)
-                continue
-            for msg in items:
-                try:
-                    frm = (msg.get("from") or {}).get("address", "")
-                    subj = msg.get("subject") or ""
-                    if "worols" not in (frm + subj).lower():
-                        continue
-                    full = self.s.get(f"{MAILTM}/messages/{msg['id']}", timeout=20).json()
-                    text = full.get("text") or ""
-                    html = full.get("html") or ""
-                    if isinstance(html, list):
-                        html = " ".join(html)
-                    text = (text + " " + html).replace("&amp;", "&")
-                    m = re.search(r"https?://[^\s\"'<>\\]*activate_account\?[^\s\"'<>\\]+", text)
-                    if m:
-                        return m.group(0)
-                    m = re.search(r"activate_account\?token=([\w\-.=]+)", text)
-                    if m:
-                        return f"https://worols.com/activate_account?token={m.group(1)}"
-                except Exception:
-                    continue
-            time.sleep(4)
-        return None
+        try:
+            msg = self.client.wait_for_message(
+                self.address,
+                timeout=timeout,
+                interval=4.0,
+                predicate=lambda m: self._extract_link(m) is not None,
+            )
+            return self._extract_link(msg)
+        except TimeoutError:
+            return None
 
 
 class Worols:
@@ -358,12 +383,12 @@ class Worols:
         return False
 
 
-def reg_one(idx: int, total: int, proxies: list[dict]) -> bool:
+def reg_one(idx: int, total: int, proxies: list[dict], providers: list[str]) -> bool:
     tag = f"{Fore.WHITE}[{idx}/{total}]{Style.RESET_ALL}"
     sess = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
     purl = proxy_url(proxy_for(proxies, sess))
 
-    mail = MailTm(proxy=purl)
+    mail = TempMail(providers=providers, proxy=purl)
     email = mail.create()
     login = re.sub(r"[^a-z0-9]", "", gen_username().lower())[:20]
     password = gen_password()
@@ -382,7 +407,6 @@ def reg_one(idx: int, total: int, proxies: list[dict]) -> bool:
         "nickname": user.get("nickname", ""),
         "email": email,
         "password": password,
-        "mailbox_password": mail.password,
         "token": "",
         "status": "pending_activation",
     }
@@ -410,13 +434,13 @@ def reg_one(idx: int, total: int, proxies: list[dict]) -> bool:
     return True
 
 
-def reg_account(idx: int, total: int, proxies: list[dict]) -> bool:
+def reg_account(idx: int, total: int, proxies: list[dict], providers: list[str]) -> bool:
     tag = f"{Fore.WHITE}[{idx}/{total}]{Style.RESET_ALL}"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if attempt > 1:
             log(f"  {tag}  {Fore.YELLOW}попытка {attempt}/{MAX_ATTEMPTS}{Style.RESET_ALL}")
         try:
-            if reg_one(idx, total, proxies):
+            if reg_one(idx, total, proxies, providers):
                 return True
         except Retry as e:
             log(f"  {tag}  {Fore.YELLOW}retry: {e}{Style.RESET_ALL}")
@@ -435,20 +459,25 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=0)
     ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--provider", type=str, default="")
     args = ap.parse_args()
 
+    print(BANNER)
     proxies = load_proxies()
     count = args.count if args.count > 0 else _ask_int("accounts", 1)
     workers = args.workers if args.workers > 0 else _ask_int("threads", DEFAULT_WORKERS)
     workers = max(1, min(workers, count))
+    providers = _ask_providers(args.provider)
+    mail_label = ",".join(providers)
 
     t0 = time.time()
-    print(BANNER)
+    print()
     _panel(
         "config",
         [
             ("accounts", f"{Fore.CYAN}{count}{Style.RESET_ALL}"),
             ("threads", f"{Fore.CYAN}{workers}{Style.RESET_ALL}"),
+            ("mail", f"{Fore.CYAN}{mail_label}{Style.RESET_ALL}"),
             ("proxies", str(len(proxies)) if proxies else "off"),
             ("saved", str(len(load_json(ACCOUNTS)))),
         ],
@@ -457,7 +486,7 @@ def main() -> int:
 
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(reg_account, i, count, proxies) for i in range(1, count + 1)]
+        futs = [pool.submit(reg_account, i, count, proxies, providers) for i in range(1, count + 1)]
         for fut in as_completed(futs):
             if fut.result():
                 ok += 1
